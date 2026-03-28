@@ -1,135 +1,206 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
-import pymongo
+from pymongo import MongoClient
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")  # We'll set this later
+# ===================== CONFIG =====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# MongoDB setup (you can run without it first)
-try:
-    client = pymongo.MongoClient(MONGO_URI) if MONGO_URI else None
-    db = client["chooll_bot"] if client else None
-    users = db["users"] if db else None
-except:
-    client = db = users = None
-    print("⚠️ Running without database (limits won't be saved)")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is missing in environment variables!")
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+client = MongoClient(MONGO_URI)
+db = client["smart_social_lookup"]
+users = db["users"]
 
-def get_user(user_id):
-    if not users:
-        return {"user_id": user_id, "plan": "free", "searches_today": 0, "last_reset": datetime.utcnow()}
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+
+# ===================== HELPERS =====================
+def get_user(user_id: int):
     user = users.find_one({"user_id": user_id})
     if not user:
-        user = {
+        users.insert_one({
             "user_id": user_id,
+            "username": None,
+            "first_name": None,
+            "tos_accepted": False,
             "plan": "free",
+            "subscription_expiry": None,
             "searches_today": 0,
-            "last_reset": datetime.utcnow(),
+            "last_reset_date": date.today(),
             "total_searches": 0
-        }
-        users.insert_one(user)
+        })
+        user = users.find_one({"user_id": user_id})
     return user
 
-def can_search(user):
-    if user.get("plan") == "free":
-        if (datetime.utcnow() - user["last_reset"]).days >= 1:
-            if users:
-                users.update_one({"user_id": user["user_id"]}, {"$set": {"searches_today": 0, "last_reset": datetime.utcnow()}})
-            user["searches_today"] = 0
-        return user["searches_today"] < 5
-    return True
+def reset_daily_if_needed(user):
+    today = date.today()
+    if user.get("last_reset_date") and user["last_reset_date"] < today:
+        users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"searches_today": 0, "last_reset_date": today}}
+        )
+        user["searches_today"] = 0
+        user["last_reset_date"] = today
+    return user
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("✅ Accept & Start", callback_data="accept")],
-        [InlineKeyboardButton("💰 View Plans", callback_data="plans")]
-    ]
-    await update.message.reply_text(
-        "👋 Welcome to **Chooll - Smart Social Lookup Bot**!\n\n"
-        "I help you find publicly available social media profiles using usernames.\n"
-        "✅ Only public links • No private data • Compliant with policies\n\n"
-        "Tap below to continue.",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+async def check_quota(user_id: int) -> tuple[bool, str]:
+    user = get_user(user_id)
+    user = reset_daily_if_needed(user)
+    
+    if user.get("plan") == "weekly" and user.get("subscription_expiry") and datetime.now() < user["subscription_expiry"]:
+        return True, "unlimited"
+    
+    if user.get("searches_today", 0) >= 5:
+        return False, "limit_reached"
+    
+    return True, "ok"
+
+def increment_search(user_id: int):
+    users.update_one(
+        {"user_id": user_id},
+        {"$inc": {"searches_today": 1, "total_searches": 1}}
     )
 
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def get_social_links(username: str):
+    username = username.strip().lstrip("@")
+    if not username:
+        return {}
+    
+    links = {
+        "Telegram": f"https://t.me/{username}",
+        "Instagram": f"https://www.instagram.com/{username}/",
+        "X / Twitter": f"https://x.com/{username}",
+        "LinkedIn": f"https://www.linkedin.com/in/{username}/",
+        "GitHub": f"https://github.com/{username}",
+        "Facebook": f"https://www.facebook.com/{username}",
+        "YouTube": f"https://youtube.com/@{username}",
+    }
+    return {k: v for k, v in links.items()}
+
+# ===================== HANDLERS =====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_user(update.effective_user.id)
-    if not can_search(user):
-        await update.message.reply_text("❌ You have reached the daily limit (5 searches on Free plan).\nUse /plans to upgrade.")
+    user["username"] = update.effective_user.username
+    user["first_name"] = update.effective_user.first_name
+    users.update_one({"user_id": user["user_id"]}, {"$set": user})
+    
+    if not user.get("tos_accepted", False):
+        tos_text = (
+            "👋 Welcome to <b>Smart Social Lookup Bot</b>!\n\n"
+            "🔒 We ONLY show publicly available profile links.\n"
+            "✅ No private data is collected.\n"
+            "✅ Fully compliant with all platform policies.\n\n"
+            "By continuing, you accept our Terms of Service."
+        )
+        keyboard = [[InlineKeyboardButton("✅ I Accept TOS", callback_data="accept_tos")]]
+        await update.message.reply_html(tos_text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    await update.message.reply_text("🔍 Send me a username (example: elonmusk or @elonmusk)")
+    
+    await main_menu(update, context)
 
-async def handle_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = get_user(update.effective_user.id)
-    if not can_search(user):
-        await update.message.reply_text("Daily limit reached.")
-        return
-
-    username = update.message.text.strip().lstrip('@').lower()
-    if len(username) < 2:
-        await update.message.reply_text("❌ Please send a valid username.")
-        return
-
-    # Record usage
-    if users:
-        users.update_one({"user_id": user["user_id"]}, {"$inc": {"searches_today": 1, "total_searches": 1}})
-
-    await update.message.reply_text(f"🔎 Looking up **@{username}**...", parse_mode='Markdown')
-
-    results = [
-        f"📱 **Telegram**: [t.me/{username}](https://t.me/{username})",
-        f"🐦 **X / Twitter**: [x.com/{username}](https://x.com/{username})",
-        f"📷 **Instagram**: [instagram.com/{username}](https://www.instagram.com/{username}/)",
-        f"💼 **LinkedIn**: [linkedin.com/in/{username}](https://www.linkedin.com/in/{username}/)",
-        f"🐙 **GitHub**: [github.com/{username}](https://github.com/{username})"
-    ]
-
-    response = f"✅ **Public Profile Links for @{username}**\n\n" + "\n\n".join(results)
-    response += "\n\n⚠️ These are direct public links. Only information that is publicly visible on each platform will appear."
-
-    await update.message.reply_text(response, parse_mode='Markdown', disable_web_page_preview=True)
-
-async def plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Free Plan (5 searches/day)", callback_data="free")],
-        [InlineKeyboardButton("Weekly Plan - ₹499/week (Unlimited)", callback_data="weekly")],
-        [InlineKeyboardButton("Pay per Search - ₹49 each", callback_data="payper")]
+        [InlineKeyboardButton("🔍 Search Profile", callback_data="search")],
+        [InlineKeyboardButton("📊 My Plan", callback_data="myplan")],
+        [InlineKeyboardButton("💳 Subscribe", callback_data="subscribe")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
     ]
-    await update.message.reply_text("💰 **Choose a Plan**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    if update.effective_user.id == ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("🔧 Admin", callback_data="admin")])
+    
+    text = "🏠 <b>Main Menu</b>\n\nWhat would you like to do?"
+    if update.message:
+        await update.message.reply_html(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data
+    user_id = query.from_user.id
 
-    if query.data == "accept":
-        await query.edit_message_text("✅ Great! Now use /search to start looking up usernames.")
-    elif query.data == "plans":
-        await plans(update, context)  # show plans again
-    else:
-        await query.edit_message_text(f"Selected: {query.data}\n\nPayment integration will be added soon.")
+    if data == "accept_tos":
+        users.update_one({"user_id": user_id}, {"$set": {"tos_accepted": True}})
+        await query.edit_message_text("✅ TOS accepted!")
+        await main_menu(update, context)
+        return
 
+    elif data == "search":
+        await query.edit_message_text("🔍 Send any username (e.g. elonmusk or @example)")
+        context.user_data["waiting_for_search"] = True
+        return
+
+    elif data == "myplan":
+        user = get_user(user_id)
+        user = reset_daily_if_needed(user)
+        status = "✅ Weekly (Unlimited)" if user.get("plan") == "weekly" and user.get("subscription_expiry") and datetime.now() < user["subscription_expiry"] else "Free (5/day)"
+        text = f"📊 <b>Your Plan</b>\n\nPlan: {status}\nSearches today: {user.get('searches_today', 0)}/5"
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="main")]]))
+
+    elif data == "subscribe":
+        text = "💳 Upgrade coming soon (Weekly / Pay-per-use)"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="main")]]))
+
+    elif data == "help":
+        text = "Send any username after clicking Search Profile.\nFree: 5 searches/day"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Back", callback_data="main")]]))
+
+    elif data == "main":
+        await main_menu(update, context)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("waiting_for_search"):
+        return
+    context.user_data["waiting_for_search"] = False
+    
+    username = update.message.text.strip()
+    user_id = update.effective_user.id
+    
+    can_search, reason = await check_quota(user_id)
+    if not can_search:
+        await update.message.reply_text("🚫 Daily limit reached. Upgrade for unlimited searches.")
+        return
+    
+    links = get_social_links(username)
+    if not links:
+        await update.message.reply_text("❌ Invalid username.")
+        return
+    
+    increment_search(user_id)
+    
+    result = f"🔍 Results for @{username}\n\n"
+    for platform, link in links.items():
+        result += f"• <b>{platform}</b>: <a href='{link}'>Open</a>\n"
+    
+    await update.message.reply_html(result)
+
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text("Admin commands: /admin_users")
+
+# ===================== MAIN =====================
 def main():
-    app = Application.builder().token(TOKEN).build()
-
+    app = Application.builder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search))
-    app.add_handler(CommandHandler("plans", plans))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username))
-    app.add_handler(CallbackQueryHandler(button_callback))
-
-    print("🚀 Chooll Bot is starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("🤖 Smart Social Lookup Bot is running...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
